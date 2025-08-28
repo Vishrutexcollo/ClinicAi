@@ -1,0 +1,15 @@
+# Bytecode and cache
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# Secrets and environment variables
+.env
+.env.*
+
+

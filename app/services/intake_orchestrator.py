@@ -143,15 +143,12 @@ def _llm_next_question(
 
 # ---------- Helpers ----------
 def _generate_patient_id(db, name: str, mobile: str) -> str:
-    today_str = datetime.now().strftime("%Y%m%d")
-    counter = db.patient_counter.find_one_and_update(
-        {"_id": today_str},
-        {"$inc": {"seq": 1}},
-        upsert=True,
-        return_document=ReturnDocument.AFTER,
-    )
-    seq = str(counter["seq"]).zfill(4)
-    return f"{CLINIC_PREFIX}-{today_str}-{seq}"
+    # Combine name and mobile to create a unique string
+    raw_id = f"{name.strip().lower()}_{mobile.strip()}"
+    # Use hashlib to create a SHA-256 hash of the string
+    hash_object = hashlib.sha256(raw_id.encode())
+    encrypted_id = hash_object.hexdigest()[:12]  # Use first 12 chars for brevity
+    return encrypted_id
 
 def _get_patient_info_by_id(db, patient_id: str) -> Optional[dict]:
     doc = db.clinicAi.find_one({"patient_id": patient_id}, {"_id": 0, "patient_info": 1})

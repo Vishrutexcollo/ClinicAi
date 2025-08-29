@@ -1,65 +1,188 @@
-# from fastapi import APIRouter, UploadFile, Form, File
-# from fastapi.responses import JSONResponse
-# from app.db import get_mongo_client
-# from utils.ocr_mistral import extract_prescription_text
-# from utils.llm import generate_postvisit_summary
-# import os
+# app/routers/consultation.py
+from datetime import datetime
+from typing import Optional, Any, Dict, List
 
-# router = APIRouter()
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
 
-# @router.post("/postvisit")
-# async def handle_post_visit(
-#     patient_id: str = Form(...),
-#     visit_id: str = Form(...),
-#     prescription: UploadFile = File(...)
-# ):
-#     # Step 1: Save prescription image locally
-#     content = await prescription.read()
-#     filename = f"temp_{visit_id}_{prescription.filename}"
-#     with open(filename, "wb") as f:
-#         f.write(content)
+from app.db import get_database
+from app.models.patient import get_note_state
+from app.services import audio_orchestrator, soap_orchestrator
 
-#     # Step 2: Extract prescription text using Mistral or other LLM OCR
-#     prescription_data = extract_prescription_text(filename)
+router = APIRouter(prefix="/consultation", tags=["Consultation"])
 
-#     # Clean up temp file
-#     try:
-#         os.remove(filename)
-#     except Exception:
-#         pass
+# ===== Audio/SOAP endpoints (kept) =====
 
-#     # Step 3: Fetch existing previsit + SOAP summaries
-#     client = get_mongo_client()
-#     db = client["doctor_ai"]  # Use your actual DB name here
-#     patients = db["patients"]
-#     patient = patients.find_one({"patient_id": patient_id})
+class AudioRequest(BaseModel):
+    patient_id: str
+    audio_url: str
 
-#     if not patient:
-#         return JSONResponse(status_code=404, content={"error": "Patient not found"})
+class SOAPRequest(BaseModel):
+    patient_id: str
 
-#     visits = patient.get("visits", [])
-#     visit = next((v for v in visits if v.get("visit_id") == visit_id), None)
+@router.post("/transcribe")
+def transcribe_audio(req: AudioRequest):
+    return audio_orchestrator.transcribe_audio_from_url(req.patient_id, req.audio_url)
 
-#     if not visit:
-#         return JSONResponse(status_code=404, content={"error": "Visit not found"})
+@router.post("/soap")
+def generate_soap(req: SOAPRequest):
+    return soap_orchestrator.generate_soap_summary(req.patient_id)
 
-#     previsit = visit.get("previsit_summary")
-#     soap = visit.get("soap_summary")
+@router.get("/state")
+def note_state(patient_id: str):
+    db = get_database()
+    return get_note_state(db, patient_id)
 
-#     # Step 4: Generate postvisit summary using prescription + previsit + SOAP
-#     postvisit_summary = generate_postvisit_summary(previsit, soap, prescription_data)
+# ===== Consultation flow (reworked to avoid positional projection) =====
 
-#     # Step 5: Update DB with prescription + postvisit_summary
-#     patients.update_one(
-#         {"patient_id": patient_id, "visits.visit_id": visit_id},
-#         {"$set": {
-#             "visits.$.prescription_data": prescription_data,
-#             "visits.$.postvisit_summary": postvisit_summary
-#         }}
-#     )
+class ConsultationStart(BaseModel):
+    patient_id: str
+    visit_id: str
 
-#     return {
-#         "message": "Postvisit data saved",
-#         "postvisit_summary": postvisit_summary,
-#         "prescription_extracted": prescription_data
-#     }
+class NoteCreate(BaseModel):
+    patient_id: str
+    visit_id: str
+    text: str = Field(..., min_length=1)
+
+class ConsultationComplete(BaseModel):
+    patient_id: str
+    visit_id: str
+    summary: Optional[str] = None
+
+class ConsultationResponse(BaseModel):
+    message: str
+
+def _get_patient(db, patient_id: str) -> Optional[Dict[str, Any]]:
+    return db.clinicAi.find_one({"patient_id": patient_id}, {"_id": 0})
+
+def _ensure_patient(db, patient_id: str) -> Dict[str, Any]:
+    doc = _get_patient(db, patient_id)
+    if not doc:
+        db.clinicAi.insert_one({
+            "patient_id": patient_id,
+            "patient_info": {},
+            "visits": [],
+            "created_at": datetime.utcnow(),
+        })
+        doc = _get_patient(db, patient_id)
+    return doc
+
+def _find_visit(visits: List[Dict[str, Any]], visit_id: str) -> Optional[Dict[str, Any]]:
+    return next((v for v in visits if v.get("visit_id") == visit_id), None)
+
+def _ensure_visit(db, patient_id: str, visit_id: str) -> Dict[str, Any]:
+    """
+    Return (patient_doc, visit_dict). Create visit if missing.
+    """
+    patient = _ensure_patient(db, patient_id)
+    visits = patient.get("visits", [])
+    visit = _find_visit(visits, visit_id)
+    if not visit:
+        visit = {
+            "visit_id": visit_id,
+            "created_at": datetime.utcnow(),
+        }
+        visits.append(visit)
+        db.clinicAi.update_one({"patient_id": patient_id}, {"$set": {"visits": visits}})
+        patient = _get_patient(db, patient_id)  # refresh
+    return patient
+
+def _get_visit_or_404(db, patient_id: str, visit_id: str) -> Dict[str, Any]:
+    patient = _get_patient(db, patient_id)
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    visit = _find_visit(patient.get("visits", []), visit_id)
+    if not visit:
+        raise HTTPException(status_code=404, detail="Visit not found")
+    return {"patient": patient, "visit": visit}
+
+def _mutate_visit(db, patient_id: str, visit_id: str, mutate_fn):
+    """
+    Load patient, mutate the specific visit in Python, write back the whole visits array.
+    """
+    patient = _ensure_patient(db, patient_id)
+    visits = patient.get("visits", [])
+    changed = False
+    for i, v in enumerate(visits):
+        if v.get("visit_id") == visit_id:
+            new_v = mutate_fn(dict(v))  # copy to avoid in-place pitfalls
+            visits[i] = new_v
+            changed = True
+            break
+    if not changed:
+        # create visit if it didn't exist
+        new_v = mutate_fn({"visit_id": visit_id, "created_at": datetime.utcnow()})
+        visits.append(new_v)
+    db.clinicAi.update_one({"patient_id": patient_id}, {"$set": {"visits": visits}})
+
+@router.post("/start", response_model=ConsultationResponse)
+def start_consultation(payload: ConsultationStart):
+    db = get_database()
+
+    # Ensure patient & visit exist
+    _ensure_visit(db, payload.patient_id, payload.visit_id)
+
+    # Set consultation status using array rewrite (mongomock-friendly)
+    def _set_started(v):
+        c = dict(v.get("consultation") or {})
+        c.update({
+            "status": "in-progress",
+            "started_at": v.get("consultation", {}).get("started_at") or datetime.utcnow(),
+        })
+        # keep existing notes if any
+        c.setdefault("notes", [])
+        v["consultation"] = c
+        return v
+
+    _mutate_visit(db, payload.patient_id, payload.visit_id, _set_started)
+    return ConsultationResponse(message="Consultation started")
+
+@router.post("/note", response_model=ConsultationResponse)
+def add_note(payload: NoteCreate):
+    db = get_database()
+
+    def _add(v):
+        c = dict(v.get("consultation") or {})
+        notes = list(c.get("notes") or [])
+        notes.append({"text": payload.text, "created_at": datetime.utcnow()})
+        c["notes"] = notes
+        c["status"] = "in-progress"
+        v["consultation"] = c
+        return v
+
+    _mutate_visit(db, payload.patient_id, payload.visit_id, _add)
+    return ConsultationResponse(message="Note added")
+
+@router.get("/{patient_id}/{visit_id}")
+def get_consultation(patient_id: str, visit_id: str):
+    db = get_database()
+    data = _get_visit_or_404(db, patient_id, visit_id)
+    visit = data["visit"]
+    c = visit.get("consultation") or {}
+    return {
+        "patient_id": patient_id,
+        "visit_id": visit_id,
+        "consultation": {
+            "status": c.get("status", "not-started"),
+            "started_at": c.get("started_at"),
+            "completed_at": c.get("completed_at"),
+            "summary": c.get("summary"),
+            "notes": c.get("notes", []),
+        },
+    }
+
+@router.post("/complete", response_model=ConsultationResponse)
+def complete_consultation(payload: ConsultationComplete):
+    db = get_database()
+
+    def _complete(v):
+        c = dict(v.get("consultation") or {})
+        c["status"] = "completed"
+        c["completed_at"] = datetime.utcnow()
+        if payload.summary:
+            c["summary"] = payload.summary
+        v["consultation"] = c
+        return v
+
+    _mutate_visit(db, payload.patient_id, payload.visit_id, _complete)
+    return ConsultationResponse(message="Consultation completed")

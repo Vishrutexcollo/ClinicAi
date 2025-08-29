@@ -159,25 +159,32 @@ def _get_patient_info_by_id(db, patient_id: str) -> Optional[dict]:
 
 # ---------- API used by your router ----------
 
+
 def create_patient_record(patient_info: PatientInfo) -> dict:
     """
     Creates (or returns) a patient record using name+mobile as dedupe.
     """
     db = get_database()
+    
+    # ✅ Use dot access for name and mobile
     existing = get_patient_by_name_mobile(db, patient_info.name, patient_info.mobile)
     if existing:
         return existing
 
     patient_id = _generate_patient_id(db, patient_info.name, patient_info.mobile)
+
     record = {
         "patient_id": patient_id,
-        "patient_info": patient_info.model_dump(),  # Pydantic v2
-        "visits": [],
-        "created_at": datetime.utcnow(),
+        "patient_info": patient_info.model_dump(),  # Correct for Pydantic v2
+        "visits": []
     }
+
     insert_patient_record(db, record)
     return record
 
+
+
+#start intake session 
 def start_intake_session(patient_id: str) -> str:
     """
     Start a session. LLM will choose each next question on demand.

@@ -7,9 +7,14 @@ router = APIRouter(prefix="/intake", tags=["Intake"])
 
 @router.post("/patient-info")
 def submit_patient_info(info: PatientInfo):
-    print(PatientInfo)
-    result = create_patient_record(info.dict())
-    return result
+    record = create_patient_record(info)
+    # Make response JSON-safe
+    if isinstance(record, dict):
+        record = dict(record)          # copy, just in case
+        record.pop("_id", None)        # or: if "_id" in record: record["_id"] = str(record["_id"])
+    return record
+
+
 
 @router.post("/start")
 def start_session(patient_id: str):

@@ -3,7 +3,8 @@ import os
 import sys
 import requests
 from app.models.patient import store_transcript
-
+from app.db import get_database
+db = get_database()
 # Ensure the parent directory is in sys.path so 'app' can be imported
 # sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.config import OPENAI_API_KEY
@@ -49,9 +50,14 @@ def transcribe_audio_from_url(patient_id, audio_url):
         transcript = whisper_response.json()["text"]
         print(" Step 5: Transcription complete:", transcript)
 
+
+        #save transcript in db
+        store_transcript(db,patient_id,transcript)
+
         return {
             "patient_id": patient_id,
-            "transcript": transcript
+            "transcript": transcript,
+            "message": "transcript saved successfully"
         }
 
     except Exception as e:

@@ -6,6 +6,7 @@ router = APIRouter(prefix="/intake", tags=["Intake"])
 
 @router.post("/register")
 def submit_patient_info(info: PatientInfo):
+    print(PatientInfo)
     result = create_patient_record(info.dict())
     return result
 

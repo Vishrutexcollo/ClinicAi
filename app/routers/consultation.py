@@ -5,7 +5,7 @@ from app.db import get_database
 from app.models.patient import get_note_state
 
 router = APIRouter(prefix="/consultation", tags=["Note & SOAP"])
-
+print("Consultation router initialized" )
 class AudioRequest(BaseModel):
     patient_id: str
     audio_url: str
